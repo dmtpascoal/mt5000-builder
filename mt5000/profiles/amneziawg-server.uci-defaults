@@ -1,0 +1,67 @@
+#!/bin/sh
+# Create an AmneziaWG server on first boot: interface awg0 on UDP 51820 with
+# 10.1.0.1/24, a firewall zone that may reach lan and wan, and the WAN port
+# opened. The private key and the obfuscation values are generated here, so
+# every router gets its own and none of them live in the image. Add peers in
+# LuCI (Network > Interfaces > awg0 > Peers) with the values awg0 shows.
+
+uci -q get network.awg0 >/dev/null && exit 0
+command -v awg >/dev/null || exit 1
+
+rnd() { # min max
+	echo $(( $1 + $(head -c4 /dev/urandom | od -An -tu4 | tr -d ' ') % ($2 - $1 + 1) ))
+}
+
+# H1-H4 ranges start in separate quarters of the 32-bit space, so they can
+# never overlap. Values 1-4 are plain WireGuard's message types; avoid them.
+hrange() { # quarter
+	lo=$(( $1 * 1073741824 + $(rnd 5 900000000) ))
+	echo "$lo-$(( lo + $(rnd 100 100000000) ))"
+}
+
+jmin=$(rnd 64 400)
+s1=$(rnd 15 150)
+s2=$(rnd 15 150)
+[ $((s1 + 56)) -eq "$s2" ] && s2=$((s2 + 1))
+
+uci batch <<UCI
+set network.awg0=interface
+set network.awg0.proto='amneziawg'
+set network.awg0.private_key='$(awg genkey)'
+set network.awg0.listen_port='51820'
+add_list network.awg0.addresses='10.1.0.1/24'
+set network.awg0.mtu='1340'
+set network.awg0.awg_jc='$(rnd 4 10)'
+set network.awg0.awg_jmin='$jmin'
+set network.awg0.awg_jmax='$(rnd $((jmin + 50)) 1000)'
+set network.awg0.awg_s1='$s1'
+set network.awg0.awg_s2='$s2'
+set network.awg0.awg_s3='$(rnd 8 64)'
+set network.awg0.awg_s4='$(rnd 8 32)'
+set network.awg0.awg_h1='$(hrange 0)'
+set network.awg0.awg_h2='$(hrange 1)'
+set network.awg0.awg_h3='$(hrange 2)'
+set network.awg0.awg_h4='$(hrange 3)'
+
+set firewall.awg=zone
+set firewall.awg.name='awg'
+add_list firewall.awg.network='awg0'
+set firewall.awg.input='ACCEPT'
+set firewall.awg.output='ACCEPT'
+set firewall.awg.forward='REJECT'
+set firewall.awg_lan=forwarding
+set firewall.awg_lan.src='awg'
+set firewall.awg_lan.dest='lan'
+set firewall.awg_wan=forwarding
+set firewall.awg_wan.src='awg'
+set firewall.awg_wan.dest='wan'
+set firewall.awg_in=rule
+set firewall.awg_in.name='Allow-AmneziaWG'
+set firewall.awg_in.src='wan'
+set firewall.awg_in.proto='udp'
+set firewall.awg_in.dest_port='51820'
+set firewall.awg_in.target='ACCEPT'
+UCI
+uci commit network
+uci commit firewall
+exit 0

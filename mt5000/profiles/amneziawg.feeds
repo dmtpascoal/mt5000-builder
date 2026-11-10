@@ -1,0 +1,2 @@
+# AmneziaWG packages for OpenWrt, at the latest commit of the feed.
+src-git amneziawg https://github.com/Slava-Shchipunov/awg-openwrt.git

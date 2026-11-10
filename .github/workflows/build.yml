@@ -1,0 +1,321 @@
+name: Build GL-MT5000
+
+# Builds an OpenWrt image for the GL.iNet GL-MT5000 (Brume 3).
+#
+# source=latest (default): current openwrt/openwrt main with the commits of
+#   PR #24237 rebased on top.
+# source=branch: dmtpascoal/openwrt branch pr24237-fixes as pushed.
+#
+# kernel=latest (default) moves the kernel to the newest stable release of
+# the target's series from kernel.org. If OpenWrt's patches don't apply to it,
+# the build falls back to the version OpenWrt pins. kernel=openwrt always uses
+# OpenWrt's version.
+#
+# Package feeds are fetched at their latest revision, and the AmneziaWG
+# packages are moved to their latest release tags. With all_kmods (default)
+# every kernel module is built as a package, so any module can be installed on
+# the flashed router later. The versions used are in the job summary and in
+# versions.md in the firmware artifact.
+#
+# Profiles in mt5000/profiles/ add packages, e.g.
+# "amneziawg wireguard adguardhome avahi usb-storage usb-tethering".
+#
+# Optional repository secret APK_SIGNING_KEY: an EC prime256v1 private key in
+# PEM format, so packages from every build share one signing key.
+
+on:
+  workflow_dispatch:
+    inputs:
+      profiles:
+        description: "Space-separated extra profiles from mt5000/profiles"
+        required: false
+        default: ""
+      source:
+        description: "latest: current main + PR #24237; branch: dmtpascoal/openwrt pr24237-fixes"
+        type: choice
+        options: [latest, branch]
+        default: latest
+      kernel:
+        description: "latest: newest stable kernel of the series; openwrt: OpenWrt's version"
+        type: choice
+        options: [latest, openwrt]
+        default: latest
+      all_kmods:
+        description: "Build every kernel module as a package"
+        type: boolean
+        default: true
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 350
+    env:
+      PROFILES: ${{ inputs.profiles }}
+      SOURCE: ${{ inputs.source || 'latest' }}
+      KERNEL: ${{ inputs.kernel || 'latest' }}
+      ALL_KMODS: ${{ inputs.all_kmods && '1' || '' }}
+      CFG: ${{ github.workspace }}/builder/mt5000
+      TARGET_DIR: bin/targets/mediatek/filogic
+    defaults:
+      run:
+        working-directory: openwrt
+
+    steps:
+      - name: Checkout builder
+        uses: actions/checkout@v5
+        with:
+          path: builder
+
+      - name: Get the OpenWrt source
+        working-directory: .
+        run: |
+          set -eu
+          if [ "$SOURCE" = branch ]; then
+            git clone --depth 1 -b pr24237-fixes https://github.com/dmtpascoal/openwrt.git openwrt
+            exit 0
+          fi
+          git clone --filter=blob:none https://github.com/openwrt/openwrt.git openwrt
+          cd openwrt
+          git config user.name "mt5000 ci"
+          git config user.email "ci@localhost"
+          git fetch --no-tags origin +refs/pull/24237/head:refs/remotes/origin/pr24237
+          base=$(git merge-base origin/main origin/pr24237)
+          git checkout -B mt5000-build origin/pr24237
+          # Commits that are already in main are dropped by the rebase.
+          if ! git rebase --onto origin/main "$base"; then
+            git rebase --abort
+            echo "::error::PR #24237 no longer rebases onto main; run with source=branch"
+            exit 1
+          fi
+          git log --oneline origin/main..HEAD
+
+      - name: Free disk space
+        working-directory: .
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /opt/hostedtoolcache/CodeQL /usr/local/share/boost
+          df -h /
+
+      - name: Install build dependencies
+        working-directory: .
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential clang flex bison gawk gcc-multilib g++-multilib \
+            gettext git libncurses-dev libssl-dev python3 rsync unzip \
+            zlib1g-dev file wget subversion swig time xsltproc ccache
+
+      - name: Validate profiles
+        run: |
+          set -eu
+          for p in $PROFILES; do
+            test -f "$CFG/profiles/$p.config" || {
+              echo "::error::unknown profile '$p'"; exit 1; }
+          done
+
+      - name: Check device support is present
+        run: |
+          set -eu
+          grep -q 'Device/glinet_gl-mt5000' target/linux/mediatek/image/filogic.mk
+          test -f target/linux/mediatek/dts/mt7987a-glinet-gl-mt5000.dts
+          grep -qx 'CONFIG_NET_DSA_REALTEK_RTL8366UB=y' target/linux/mediatek/filogic/config-6.18
+
+      - name: Move to the latest stable kernel
+        if: env.KERNEL == 'latest'
+        run: |
+          set -eu
+          series=$(sed -n 's/^KERNEL_PATCHVER:=//p' target/linux/mediatek/Makefile)
+          f=target/linux/generic/kernel-$series
+          cur=$series$(sed -n "s/^LINUX_VERSION-$series = //p" "$f")
+          new=$(curl -fsS https://www.kernel.org/releases.json |
+            jq -r --arg s "$series." '.releases[].version | select(startswith($s))' |
+            sort -V | tail -1)
+          echo "KERNEL_OPENWRT=$cur" >> "$GITHUB_ENV"
+          echo "KERNEL_UPSTREAM=${new:-unknown}" >> "$GITHUB_ENV"
+          if [ -z "$new" ] || [ "$(printf '%s\n%s\n' "$cur" "$new" | sort -V | tail -1)" = "$cur" ]; then
+            echo "OpenWrt's $cur is already the latest $series release."
+            exit 0
+          fi
+          hash=$(curl -fsS https://cdn.kernel.org/pub/linux/kernel/v${series%%.*}.x/sha256sums.asc |
+            awk -v t="linux-$new.tar.xz" '$2 == t { print $1 }')
+          test -n "$hash"
+          cp "$f" "$RUNNER_TEMP/kernel-$series.orig"
+          sed -i -e "s/^LINUX_VERSION-$series = .*/LINUX_VERSION-$series = ${new#$series}/" \
+            -e "s/^LINUX_KERNEL_HASH-.*/LINUX_KERNEL_HASH-$new = $hash/" "$f"
+          cat "$f"
+          echo "KERNEL_BUMP=$series" >> "$GITHUB_ENV"
+          echo "Kernel moved from $cur to $new."
+
+      - name: Set up Go (AdGuard Home)
+        if: contains(inputs.profiles, 'adguardhome')
+        uses: actions/setup-go@v5
+        with:
+          go-version: stable
+
+      - name: Restore download cache
+        uses: actions/cache@v4
+        with:
+          path: openwrt/dl
+          key: dl-${{ github.run_id }}
+          restore-keys: dl-
+
+      - name: Restore compiler cache
+        uses: actions/cache@v4
+        with:
+          path: openwrt/.ccache
+          key: ccache-${{ github.run_id }}
+          restore-keys: ccache-
+
+      - name: Feeds
+        run: |
+          set -eu
+          cp feeds.conf.default feeds.conf
+          for p in $PROFILES; do
+            f="$CFG/profiles/$p.feeds"
+            [ ! -f "$f" ] || cat "$f" >> feeds.conf
+          done
+          ./scripts/feeds update -a
+          for p in $PROFILES; do
+            h="$CFG/profiles/$p.post-feeds.sh"
+            [ ! -x "$h" ] || "$h"
+          done
+          ./scripts/feeds install -a
+
+      - name: Configure
+        run: |
+          set -eu
+          {
+            cat "$CFG/default.config"
+            for p in $PROFILES; do cat "$CFG/profiles/$p.config"; done
+            [ -z "$ALL_KMODS" ] || echo CONFIG_ALL_KMODS=y
+            # Build speed: compiler cache, and skip the toolchain debugger.
+            echo CONFIG_DEVEL=y
+            echo CONFIG_CCACHE=y
+            echo CONFIG_TOOLCHAINOPTS=y
+            echo '# CONFIG_GDB is not set'
+            if command -v go >/dev/null; then
+              echo "CONFIG_GOLANG_EXTERNAL_BOOTSTRAP_ROOT=\"$(go env GOROOT)\""
+            fi
+          } > .config
+          cp .config requested.config
+          make defconfig
+          # Every package that was asked for must have survived defconfig.
+          missing=0
+          for sym in $(grep -oE '^CONFIG_PACKAGE_[^=]+=y' requested.config); do
+            grep -qx "$sym" .config || { echo "::error::$sym dropped by defconfig"; missing=1; }
+          done
+          [ "$missing" = 0 ]
+          grep -x 'CONFIG_TARGET_mediatek_filogic_DEVICE_glinet_gl-mt5000=y' .config
+
+      - name: Package signing key
+        env:
+          APK_SIGNING_KEY: ${{ secrets.APK_SIGNING_KEY }}
+        run: |
+          if [ -n "$APK_SIGNING_KEY" ]; then
+            printf '%s\n' "$APK_SIGNING_KEY" > private-key.pem
+            chmod 600 private-key.pem
+            echo "Using the persistent package signing key."
+          else
+            echo "::notice::No APK_SIGNING_KEY secret; packages are signed with a throwaway key."
+          fi
+
+      - name: Download sources
+        run: make download -j8 || make download -j1 V=s
+
+      - name: Check the kernel patches apply
+        if: env.KERNEL_BUMP != ''
+        run: |
+          set -eu
+          make -j$(nproc) tools/install
+          if make target/linux/prepare > "$RUNNER_TEMP/prepare.log" 2>&1; then
+            echo "OpenWrt's patches apply to $KERNEL_UPSTREAM."
+            exit 0
+          fi
+          tail -40 "$RUNNER_TEMP/prepare.log"
+          echo "::warning::OpenWrt's patches don't apply to $KERNEL_UPSTREAM; building $KERNEL_OPENWRT instead."
+          cp "$RUNNER_TEMP/kernel-$KERNEL_BUMP.orig" "target/linux/generic/kernel-$KERNEL_BUMP"
+          echo "KERNEL_FALLBACK=1" >> "$GITHUB_ENV"
+          make target/linux/clean
+          make download -j8
+
+      - name: Build
+        run: |
+          # IGNORE_ERRORS=m: a module that only exists because of all_kmods
+          # (=m) is skipped if it fails; anything selected (=y) still fails.
+          ign=${ALL_KMODS:+IGNORE_ERRORS=m}
+          make -j$(nproc) $ign || make -j1 V=s $ign
+
+      - name: Record versions
+        if: always()
+        run: |
+          series=$(sed -n 's/^KERNEL_PATCHVER:=//p' target/linux/mediatek/Makefile)
+          kver=$series$(sed -n "s/^LINUX_VERSION-$series = //p" "target/linux/generic/kernel-$series")
+          {
+            echo "## Sources"
+            echo "- source: $SOURCE"
+            echo "- tree: \`$(git log -1 --format='%h %s (%cs)')\`"
+            if git rev-parse -q --verify origin/pr24237 >/dev/null; then
+              echo "- openwrt main: \`$(git log -1 --format='%h %s (%cs)' origin/main)\`"
+              echo "- PR #24237 head: \`$(git log -1 --format='%h %s (%cs)' origin/pr24237)\`"
+            fi
+            echo "## Kernel"
+            echo "- built: $kver"
+            [ -z "${KERNEL_OPENWRT:-}" ] || echo "- OpenWrt pins: $KERNEL_OPENWRT; latest $series on kernel.org: $KERNEL_UPSTREAM"
+            [ -z "${KERNEL_FALLBACK:-}" ] || echo "- fell back to OpenWrt's version: patches did not apply to $KERNEL_UPSTREAM"
+            echo "## Feeds"
+            for d in feeds/*/; do
+              [ -d "$d.git" ] || continue
+              echo "- $(basename "$d"): \`$(git -C "$d" log -1 --format='%h (%cs)')\`"
+            done
+            for m in feeds/amneziawg/kmod-amneziawg/Makefile feeds/amneziawg/amneziawg-tools/Makefile; do
+              [ -f "$m" ] || continue
+              echo "- $(sed -n 's/^PKG_NAME:=//p' "$m"): $(sed -n 's/^PKG_VERSION:=//p' "$m")"
+            done
+            echo "## Options"
+            echo "- profiles: ${PROFILES:-none}"
+            echo "- all kernel modules as packages: ${ALL_KMODS:+yes}${ALL_KMODS:-no}"
+          } | tee versions.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Verify output
+        run: |
+          set -eu
+          ls -lah "$TARGET_DIR"
+          for img in squashfs-sysupgrade.bin squashfs-factory.bin initramfs-kernel.bin; do
+            test -s "$TARGET_DIR/openwrt-mediatek-filogic-glinet_gl-mt5000-$img"
+          done
+          manifest="$TARGET_DIR/openwrt-mediatek-filogic-glinet_gl-mt5000.manifest"
+          test -s "$manifest"
+          missing=0
+          for pkg in $(grep -oE '^CONFIG_PACKAGE_[^=]+=y' requested.config | sed 's/^CONFIG_PACKAGE_//; s/=y$//'); do
+            grep -q "^$pkg " "$manifest" || { echo "::error::$pkg missing from the image"; missing=1; }
+          done
+          [ "$missing" = 0 ]
+          series=$(sed -n 's/^KERNEL_PATCHVER:=//p' target/linux/mediatek/Makefile)
+          kver=$(sed -n "s/^LINUX_VERSION-$series = //p" "target/linux/generic/kernel-$series")
+          if grep -qx 'CONFIG_PACKAGE_kmod-amneziawg=y' .config; then
+            ko=$(find build_dir -name amneziawg.ko | head -1); test -n "$ko"
+            strings "$ko" | grep -q "^vermagic=$series$kver "
+          fi
+          case " $PROFILES " in *" amneziawg-server "*)
+            ls build_dir/target-*/root-mediatek/etc/uci-defaults/90-amneziawg-server ;;
+          esac
+
+      - name: Upload images
+        uses: actions/upload-artifact@v5
+        with:
+          name: gl-mt5000-firmware
+          if-no-files-found: error
+          path: |
+            openwrt/${{ env.TARGET_DIR }}/*glinet_gl-mt5000*
+            openwrt/${{ env.TARGET_DIR }}/sha256sums
+            openwrt/${{ env.TARGET_DIR }}/*.buildinfo
+            openwrt/versions.md
+
+      - name: Upload packages
+        uses: actions/upload-artifact@v5
+        with:
+          name: gl-mt5000-packages
+          if-no-files-found: error
+          path: |
+            openwrt/${{ env.TARGET_DIR }}/packages
+            openwrt/bin/packages
