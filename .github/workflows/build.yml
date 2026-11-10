@@ -112,6 +112,13 @@ jobs:
             test -f "$CFG/profiles/$p.config" || {
               echo "::error::unknown profile '$p'"; exit 1; }
           done
+          has() { case " $PROFILES " in *" $1 "*) return 0;; esac; return 1; }
+          for pair in "pbr mwan3" "adblock-fast adguardhome"; do
+            set -- $pair
+            if has "$1" && has "$2"; then
+              echo "::error::profiles $1 and $2 conflict; pick one"; exit 1
+            fi
+          done
 
       - name: Check device support is present
         run: |
@@ -146,8 +153,8 @@ jobs:
           echo "KERNEL_BUMP=$series" >> "$GITHUB_ENV"
           echo "Kernel moved from $cur to $new."
 
-      - name: Set up Go (AdGuard Home)
-        if: contains(inputs.profiles, 'adguardhome')
+      - name: Set up Go (AdGuard Home, Tailscale)
+        if: contains(inputs.profiles, 'adguardhome') || contains(inputs.profiles, 'tailscale')
         uses: actions/setup-go@v5
         with:
           go-version: stable

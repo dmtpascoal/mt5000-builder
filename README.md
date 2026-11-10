@@ -39,9 +39,21 @@ base image (device support, LuCI, USB 3), or list profiles from
 | `wireguard` | `wireguard-tools`, LuCI page |
 | `adguardhome` | AdGuard Home |
 | `avahi` | avahi daemon without D-Bus (mDNS, reflector) |
-| `ddns-cloudflare` | Cloudflare dynamic DNS with the LuCI page |
+| `sqm` | SQM (cake) against bufferbloat, LuCI page |
+| `ddns` | Dynamic DNS (deSEC, Cloudflare, DuckDNS, Dynu, ...), LuCI page |
+| `tailscale` | Tailscale, for remote access without port forwarding |
+| `pbr` | Policy-based routing per device, subnet or domain, LuCI page; not with `mwan3` |
+| `mwan3` | Multi-WAN failover, LuCI page; not with `pbr` |
+| `diag` | `tcpdump`, `iperf3`, `htop`, `ethtool`, `ip-full` |
 | `usb-storage` | USB mass storage and UAS, automount, exFAT |
 | `usb-tethering` | iPhone USB tethering (`ipheth`, `usbmuxd`) and Android/dongle USB Ethernet (`cdc-ether`, `rndis`, `cdc-ncm`); add the phone's interface as a WAN in LuCI |
+| `upnp` | UPnP/NAT-PMP port mapping, installed switched off |
+| `adblock-fast` | DNS ad blocking through dnsmasq, LuCI page; not with `adguardhome` |
+| `https-dns-proxy` | DNS over HTTPS upstream for dnsmasq, LuCI page |
+| `ttyd` | Web terminal in LuCI |
+
+A typical house: `sqm ddns tailscale diag usb-storage usb-tethering`, plus
+`wireguard` or `amneziawg` for a VPN server.
 
 A profile is a `<name>.config` with `CONFIG_PACKAGE_...=y` lines. It may also
 have a `<name>.feeds` file (extra feed lines) and an executable
