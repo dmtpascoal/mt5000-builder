@@ -233,17 +233,51 @@ jobs:
         if: env.KERNEL_BUMP != ''
         run: |
           set -eu
-          make -j$(nproc) tools/install
-          if make target/linux/prepare > "$RUNNER_TEMP/prepare.log" 2>&1; then
-            echo "OpenWrt's patches apply to $KERNEL_UPSTREAM."
+          s=$KERNEL_BUMP
+          # Apply the series in OpenWrt's order to a scratch copy. A patch
+          # that fails but reverses cleanly is already in the new kernel and
+          # is dropped; any other failure blocks the kernel move.
+          k="$RUNNER_TEMP/linux"; rm -rf "$k"; mkdir -p "$k"
+          tar xf "dl/linux-$KERNEL_UPSTREAM.tar.xz" -C "$k" --strip-components=1
+          for d in generic/files generic/files-$s mediatek/files mediatek/files-$s; do
+            [ ! -d "target/linux/$d" ] || cp -R "target/linux/$d/." "$k/"
+          done
+          : > "$RUNNER_TEMP/dropped"; : > "$RUNNER_TEMP/blocked"
+          for d in generic/backport-$s generic/pending-$s generic/hack-$s mediatek/patches-$s; do
+            for p in target/linux/$d/*.patch; do
+              [ -f "$p" ] || continue
+              if patch -d "$k" -p1 -N --dry-run -s < "$p" >/dev/null 2>&1; then
+                patch -d "$k" -p1 -N -s --no-backup-if-mismatch < "$p" >/dev/null
+              elif patch -d "$k" -p1 -R --dry-run -s < "$p" >/dev/null 2>&1; then
+                echo "$d/$(basename "$p")" >> "$RUNNER_TEMP/dropped"
+              else
+                echo "$d/$(basename "$p")" >> "$RUNNER_TEMP/blocked"
+              fi
+            done
+          done
+          {
+            echo "KERNEL_DROPPED=$(paste -sd' ' "$RUNNER_TEMP/dropped")"
+            echo "KERNEL_BLOCKED=$(paste -sd' ' "$RUNNER_TEMP/blocked")"
+          } >> "$GITHUB_ENV"
+          if [ -s "$RUNNER_TEMP/blocked" ]; then
+            echo "::warning::Patches that need a refresh for $KERNEL_UPSTREAM: $(paste -sd' ' "$RUNNER_TEMP/blocked"); building $KERNEL_OPENWRT instead."
+            cp "$RUNNER_TEMP/kernel-$s.orig" "target/linux/generic/kernel-$s"
+            echo "KERNEL_FALLBACK=1" >> "$GITHUB_ENV"
+            make download -j8
             exit 0
           fi
-          tail -40 "$RUNNER_TEMP/prepare.log"
-          echo "::warning::OpenWrt's patches don't apply to $KERNEL_UPSTREAM; building $KERNEL_OPENWRT instead."
-          cp "$RUNNER_TEMP/kernel-$KERNEL_BUMP.orig" "target/linux/generic/kernel-$KERNEL_BUMP"
-          echo "KERNEL_FALLBACK=1" >> "$GITHUB_ENV"
-          make target/linux/clean
-          make download -j8
+          while read -r p; do
+            echo "Dropping $p (already in $KERNEL_UPSTREAM)"
+            rm "target/linux/$p"
+          done < "$RUNNER_TEMP/dropped"
+          # Confirm with OpenWrt's own patch step.
+          make -j$(nproc) tools/install
+          make target/linux/prepare V=s > "$RUNNER_TEMP/prepare.log" 2>&1 || {
+            tail -60 "$RUNNER_TEMP/prepare.log"
+            echo "::error::target/linux/prepare failed for $KERNEL_UPSTREAM; run with kernel=openwrt"
+            exit 1
+          }
+          echo "OpenWrt's patches apply to $KERNEL_UPSTREAM."
 
       - name: Build
         run: |
@@ -268,7 +302,8 @@ jobs:
             echo "## Kernel"
             echo "- built: $kver"
             [ -z "${KERNEL_OPENWRT:-}" ] || echo "- OpenWrt pins: $KERNEL_OPENWRT; latest $series on kernel.org: $KERNEL_UPSTREAM"
-            [ -z "${KERNEL_FALLBACK:-}" ] || echo "- fell back to OpenWrt's version: patches did not apply to $KERNEL_UPSTREAM"
+            [ -z "${KERNEL_DROPPED:-}" ] || echo "- patches already in $KERNEL_UPSTREAM: $KERNEL_DROPPED"
+            [ -z "${KERNEL_FALLBACK:-}" ] || echo "- fell back to OpenWrt's version; needs a refresh: $KERNEL_BLOCKED"
             echo "## Feeds"
             for d in feeds/*/; do
               [ -d "$d.git" ] || continue
@@ -280,7 +315,7 @@ jobs:
             done
             echo "## Options"
             echo "- profiles: ${PROFILES:-none}"
-            echo "- all kernel modules as packages: ${ALL_KMODS:+yes}${ALL_KMODS:-no}"
+            echo "- all kernel modules as packages: $([ -n "$ALL_KMODS" ] && echo yes || echo no)"
           } | tee versions.md >> "$GITHUB_STEP_SUMMARY"
 
       - name: Verify output
